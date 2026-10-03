@@ -7,38 +7,40 @@
 #include "controller.h"
 #include "bsp_supervise.h"
 #include "encos_protocol.h"
+#include <stdint.h>
 
-/* ENCOS V1.20EAP driver. MT4 names retained for existing call sites.
+/* ENCOS V1.20EAP driver.
+ * Formerly published under MT4 names; API renamed to ENCOS_motor / ENCOSmotor_*.
  * All ranges MUST match the motor's actual stored protocol settings.
  * No automatic motor configuration, zeroing, brake release or ID changes.
  * APIs/Rx/Calc_Send must be serialized by the caller (see README_ENCOS.md).
  */
-struct mt4_motor_t;
-typedef void (*control_mt4_func)(struct mt4_motor_t *motor);
-typedef float (*calc_fdb_func_mt4)(void *arg);
-typedef enum { mt4_stop, mt4_enable } MT4_enable;
-typedef enum { mt4_output_normal, mt4_output_reverse } MT4_output_mode;
-typedef enum { mt4_soft_stop, mt4_damping_stop } MT4_stop_mode;
+struct encos_motor_t;
+typedef void (*control_encos_func)(struct encos_motor_t *motor);
+typedef float (*calc_fdb_func_encos)(void *arg);
+typedef enum { encos_stop, encos_enable } ENCOS_enable;
+typedef enum { encos_output_normal, encos_output_reverse } ENCOS_output_mode;
+typedef enum { encos_soft_stop, encos_damping_stop } ENCOS_stop_mode;
 
-typedef struct mt4_motor_config_t {
+typedef struct encos_motor_config_t {
     uint8_t bsp_can_index;
     uint16_t can_tx_id, can_rx_id; /* 1..0x7FE; must be equal */
     controller_config motor_controller_config;
-    calc_fdb_func_mt4 pos_fdb_calc, speed_fdb_calc;
+    calc_fdb_func_encos pos_fdb_calc, speed_fdb_calc;
     void *arg;
     lost_callback lost_callback_;
-    MT4_output_mode output_mode;
+    ENCOS_output_mode output_mode;
     uint16_t fre_rel; /* send every N Calc_Send calls, 0 means 1 */
     ENCOS_Ranges ranges; /* REQUIRED: kp/kd/position/speed/torque/current min/max */
     float torque_constant; /* Nm/A; 0 = unknown, estimated torque is invalid */
     float position_offset; /* rad; host coordinate = motor position + offset */
     uint32_t feedback_timeout_ms; /* 0 means 100ms; independent of motor CAN timeout */
-    MT4_stop_mode stop_mode; /* default zero-current, optional variable damping brake */
-} MT4_motor_config;
+    ENCOS_stop_mode stop_mode; /* default zero-current, optional variable damping brake */
+} ENCOS_motor_config;
 
-typedef struct mt4_motor_t {
-    MT4_motor_config config;
-    MT4_enable enable;
+typedef struct encos_motor_t {
+    ENCOS_motor_config config;
+    ENCOS_enable enable;
     uint8_t update; /* set to 1 after accepted reply; caller may clear */
     uint8_t rx_data[8], rx_len, errcode;
     ENCOS_Feedback feedback; /* latest typed reply including raw query payload */
@@ -53,38 +55,38 @@ typedef struct mt4_motor_t {
     monitor_item *monitor;
     FPS_t motor_fps;
     controller *motor_controller;
-    control_mt4_func control_calc;
-    uint8_t (*check_motor_inplace)(struct mt4_motor_t *, float range);
+    control_encos_func control_calc;
+    uint8_t (*check_motor_inplace)(struct encos_motor_t *, float range);
     uint8_t zero_pending, zero_ack_received, zero_ack_success;
     uint32_t zero_sent_ms;
     ENCOS_Result last_result;
-} MT4_motor;
+} ENCOS_motor;
 
-#define MT4_CAN_ID_MIN 0x001u
-#define MT4_CAN_ID_MAX 0x7FEu
-#define MT4_BROADCAST_ID ENCOS_SETTINGS_ID
-#define MT4_OFFLINE_TIMEOUT_MS 100u
-#define MT4_SETTING_GUARD_MS 501u /* manual section 3.5 requires >500ms */
-#define MT4_ZERO_ACK_TIMEOUT_MS 1000u /* host policy, not a protocol guarantee */
+#define ENCOS_CAN_ID_MIN 0x001u
+#define ENCOS_CAN_ID_MAX 0x7FEu
+#define ENCOS_BROADCAST_ID ENCOS_SETTINGS_ID
+#define ENCOS_OFFLINE_TIMEOUT_MS 100u
+#define ENCOS_SETTING_GUARD_MS 501u /* manual section 3.5 requires >500ms */
+#define ENCOS_ZERO_ACK_TIMEOUT_MS 1000u /* host policy, not a protocol guarantee */
 
-void MT4motor_Driver_Init(void);
-MT4_motor *MT4motor_Create(MT4_motor_config *config, control_mt4_func func);
-void MT4motor_Calc_Send(void);
+void ENCOSmotor_Driver_Init(void);
+ENCOS_motor *ENCOSmotor_Create(ENCOS_motor_config *config, control_encos_func func);
+void ENCOSmotor_Calc_Send(void);
 /* Enable is a LOCAL state change, requires fresh position/speed and no reported error. */
-ENCOS_Result MT4motor_Enable(MT4_motor *obj);
+ENCOS_Result ENCOSmotor_Enable(ENCOS_motor *obj);
 /* Disable means software STOP, not physical power-stage disable. Sends stop frame now. */
-ENCOS_Result MT4motor_Disable(MT4_motor *obj);
+ENCOS_Result ENCOSmotor_Disable(ENCOS_motor *obj);
 /* Stop all motors on this CAN bus before zeroing. Bus TX pauses >500ms afterward. */
-ENCOS_Result MT4motor_Save_Zero(MT4_motor *obj);
-ENCOS_Result MT4motor_Query(MT4_motor *obj, uint8_t decimal_code);
+ENCOS_Result ENCOSmotor_Save_Zero(ENCOS_motor *obj);
+ENCOS_Result ENCOSmotor_Query(ENCOS_motor *obj, uint8_t decimal_code);
 /* Pure builders in encos_protocol.h cover servo/current/torque/brake/ID commands.
  * Do not bypass this driver's bus setting guard when transmitting those frames. */
-void MT4motor_RxCallBack(uint8_t can_id, uint32_t identifier, uint8_t *data, basic_data_t len);
-ENCOS_Result MT4motor_FeedbackData_Update(MT4_motor *obj, const uint8_t *data, size_t len);
-const char *MT4motor_Err_String(uint8_t errcode);
-uint8_t MT4motor_Is_Online(MT4_motor *obj);
-uint8_t MT4Motor_Check_InPlace(MT4_motor *obj, float range);
+void ENCOSmotor_RxCallBack(uint8_t can_id, uint32_t identifier, uint8_t *data, uint32_t len);
+ENCOS_Result ENCOSmotor_FeedbackData_Update(ENCOS_motor *obj, const uint8_t *data, size_t len);
+const char *ENCOSmotor_Err_String(uint8_t errcode);
+uint8_t ENCOSmotor_Is_Online(ENCOS_motor *obj);
+uint8_t ENCOSMotor_Check_InPlace(ENCOS_motor *obj, float range);
 /* Legacy unsupported operations are explicit, never emit invented commands. */
-ENCOS_Result MT4motor_Clear_Err(MT4_motor *obj);
-ENCOS_Result MT4motor_Reset_Round(MT4_motor *obj);
-ENCOS_Result MT4motor_Broadcast_Cmd(MT4_motor *obj, uint8_t sub_cmd);
+ENCOS_Result ENCOSmotor_Clear_Err(ENCOS_motor *obj);
+ENCOS_Result ENCOSmotor_Reset_Round(ENCOS_motor *obj);
+ENCOS_Result ENCOSmotor_Broadcast_Cmd(ENCOS_motor *obj, uint8_t sub_cmd);
