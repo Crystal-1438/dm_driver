@@ -44,6 +44,8 @@ typedef struct {
     float current; /* A, NOT torque */
     float motor_temp, mos_temp; /* deg C, preserves 0.5 degree resolution */
     uint8_t code, status, brake_released;
+    ENCOS_Range query_range; /* type 5/code 23..28, decoded physical range */
+    float query_value; /* type 5/code 1..5, 22, 31; wire's physical units */
     uint8_t payload[6], payload_len; /* query/config details; never auto-applied */
 } ENCOS_Feedback;
 

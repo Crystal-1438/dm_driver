@@ -24,9 +24,20 @@ int main(void) {
     frame_is(&f, 1, mixed, 8);
     assert(ENCOS_PackMixed(&f, 1, &ranges, 20, 2.5f, 0, 0, 0) == ENCOS_OK);
     assert((f.data[1] & 1) == 0 && f.data[2] == 255);
+    assert(ENCOS_PackMixed(&f,1,&ranges,999,999,999,999,999) == ENCOS_OK);
+    const uint8_t top[] = {0x1F,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF};
+    frame_is(&f,1,top,8);
+    assert(ENCOS_PackMixed(&f,1,&ranges,-999,-999,-999,-999,-999) == ENCOS_OK);
+    const uint8_t bottom[8] = {0}; frame_is(&f,1,bottom,8);
     const uint8_t pos[] = {0x20,0,0,0,0,0x7D,0x01,0x91};
     assert(ENCOS_PackPosition(&f, 1, 0, 50, 10, 1) == ENCOS_OK);
     frame_is(&f, 1, pos, 8);
+    const uint8_t pos90[] = {0x28,0x56,0x80,0,0,0x32,0,0xCA};
+    assert(ENCOS_PackPosition(&f, 1, 90, 20, 5, 2) == ENCOS_OK);
+    frame_is(&f, 1, pos90, 8);
+    const uint8_t neg90[] = {0x38,0x56,0x80,0,0,0x32,0,0xCA};
+    assert(ENCOS_PackPosition(&f, 1, -90, 20, 5, 2) == ENCOS_OK);
+    frame_is(&f, 1, neg90, 8);
     const uint8_t spd[] = {0x41,0x42,0x48,0,0,0,0x64};
     assert(ENCOS_PackSpeed(&f, 1, 50, 10, 1) == ENCOS_OK);
     frame_is(&f, 1, spd, 7);
@@ -73,6 +84,10 @@ int main(void) {
     const uint8_t type5[] = {0xA0,24,0,0,0,50};
     assert(ENCOS_Decode(type5, 6, &r, &fb) == ENCOS_OK);
     assert(fb.code == 24 && fb.payload_len == 4 && fb.payload[3] == 50 && !fb.valid);
+    assert(fb.query_range.min == 0 && fb.query_range.max == 50);
+    const uint8_t current_range[] = {0xA0,28,0xFF,0x9C,0,0xC8};
+    assert(ENCOS_Decode(current_range,6,&r,&fb) == ENCOS_OK);
+    near(fb.query_range.min,-10); near(fb.query_range.max,20);
     const uint8_t query_pos[] = {0xA0,1,0x42,0xB4,0,0};
     assert(ENCOS_Decode(query_pos, 6, &r, &fb) == ENCOS_OK);
     near(fb.position, ENCOS_PI/2);
@@ -97,6 +112,14 @@ int main(void) {
     assert(ENCOS_PackPosition(&f, 1, 0, -1, 1, 1) == ENCOS_INVALID);
     assert(ENCOS_PackSpeed(&f, 1, 0, 1, 4) == ENCOS_INVALID);
     assert(ENCOS_PackQuery(&f, 1, 36) == ENCOS_UNSUPPORTED);
+    /* Every supported packet family rejects truncated and overlong frames. */
+    const uint8_t *packets[] = {type1,type2,type3,type4,type5,type6};
+    const size_t lengths[] = {8,8,8,3,6,2};
+    for (size_t i=0;i<6;++i) {
+        uint8_t buffer[9] = {0}; memcpy(buffer,packets[i],lengths[i]);
+        for (size_t n=0;n<=9;++n) if (n!=lengths[i])
+            assert(ENCOS_Decode(buffer,n,&ranges,&fb) != ENCOS_OK);
+    }
     puts("ENCOS protocol tests passed");
     return 0;
 }

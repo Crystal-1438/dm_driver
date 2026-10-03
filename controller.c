@@ -45,6 +45,7 @@ void controller_calc(controller* obj) {
 // 务必确保传入的config结构体已经memset置零!!!
 controller* create_controller(controller_config* _config) {
     controller* obj = RT_MALLOC(sizeof(controller));
+    if (obj == NULL) return NULL;
     memset(obj, 0, sizeof(controller));
     obj->config = *_config;
     // 只有 PID 一种算法，两个环的参数一并初始化。

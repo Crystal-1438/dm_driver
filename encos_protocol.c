@@ -194,10 +194,22 @@ ENCOS_Result ENCOS_Decode(const uint8_t *d, size_t len, const ENCOS_Ranges *r,
         if (f.code <= 4) {
             float x = read_float(d + 2);
             if (!isfinite(x)) return ENCOS_INVALID;
+            f.query_value = x;
             if (f.code == 1) { f.position = x * (ENCOS_PI / 180); f.valid = ENCOS_HAS_POSITION; }
             if (f.code == 2) { f.speed = x * (ENCOS_PI / 30); f.valid = ENCOS_HAS_SPEED; }
             if (f.code == 3) { f.current = x; f.valid = ENCOS_HAS_CURRENT; }
             if (!isfinite(f.position) || !isfinite(f.speed)) return ENCOS_INVALID;
+        }
+        if (f.code == 5 || f.code == 22 || f.code == 31)
+            f.query_value = (float)be16(d + 2) / (f.code == 31 ? 1 : 100);
+        if (f.code >= 23 && f.code <= 28) {
+            if (f.code <= 24) {
+                f.query_range = (ENCOS_Range){(float)be16(d + 2), (float)be16(d + 4)};
+            } else {
+                float scale = f.code <= 26 ? 100 : 10;
+                f.query_range = (ENCOS_Range){signed16(d + 2) / scale, signed16(d + 4) / scale};
+            }
+            if (!valid_range(f.query_range)) return ENCOS_INVALID;
         }
         if (f.code == 37) {
             if (d[2] > 1) return ENCOS_INVALID;

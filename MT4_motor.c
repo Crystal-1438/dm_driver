@@ -1,271 +1,240 @@
 #include "MT4_motor.h"
 #if _HAL_MT4MOTOR_ENABLE
 #include "bsp_log.h"
-#include "common.h"
-
-// can_tx_id == 控制帧 ID，同时也是反馈帧 ID
-// 本协议下电机的发送与接收共用一个 ID，config.can_rx_id 必须等于 config.can_tx_id
-/* 控制帧ID规则为
-    仅一种模式：0x000 + CAN_ID
-    （不像达妙那样有 0x100 / 0x200 的模式偏移）
-*/
-/* 反馈帧ID为
-    CAN_ID（电机自身 ID）
-*/
+#include <math.h>
+#include <string.h>
 
 cvector *mt4_motor_list;
+static uint8_t registry[DEVICE_CAN_CNT];
+static uint8_t bus_guard[DEVICE_CAN_CNT];
+static uint32_t bus_setting_ms[DEVICE_CAN_CNT];
 
-/* SDK 的定标用 (1<<bits)-1 作分母，与 common.h 里的实现未必一致，
- * 为保证与 libarx_x5_src.so 逐位对齐，这里单独实现一份。*/
-static uint16_t MT4_Float_To_Uint(float x, float x_min, float x_max, uint8_t bits)
-{
-    float span = x_max - x_min;
-    if (x > x_max) x = x_max;
-    if (x < x_min) x = x_min;
-    return (uint16_t)((x - x_min) * (float)((1 << bits) - 1) / span);
+static uint32_t now_ms(void) { return (uint32_t)BSP_sys_time_ms(); }
+static int bus_busy(uint8_t bus) {
+    if (!bus_guard[bus]) return 0;
+    if ((uint32_t)(now_ms() - bus_setting_ms[bus]) < MT4_SETTING_GUARD_MS) return 1;
+    bus_guard[bus] = 0;
+    return 0;
 }
-
-static float MT4_Uint_To_Float(uint16_t x_int, float x_min, float x_max, uint8_t bits)
-{
-    float span = x_max - x_min;
-    return (float)x_int * span / (float)((1 << bits) - 1) + x_min;
+static ENCOS_Result send_frame(MT4_motor *obj, const ENCOS_Frame *frame) {
+    if (bus_busy(obj->config.bsp_can_index)) return ENCOS_BUSY;
+    BSP_CAN_Send(obj->config.bsp_can_index, frame->id, (uint8_t *)frame->data, frame->len);
+    return ENCOS_OK; /* submitted to BSP; NOT an acknowledgement from motor */
 }
-
+static void reset_controller(MT4_motor *obj) {
+    controller *c = obj->motor_controller;
+    PID_Init(&c->pid_pos_data, &obj->config.motor_controller_config.position_pid_config);
+    PID_Init(&c->pid_speed_data, &obj->config.motor_controller_config.speed_pid_config);
+    PID_Config p = c->pid_pos_data.config, s = c->pid_speed_data.config;
+    memset(&c->pid_pos_data, 0, sizeof(c->pid_pos_data));
+    memset(&c->pid_speed_data, 0, sizeof(c->pid_speed_data));
+    c->pid_pos_data.config = p; c->pid_speed_data.config = s;
+    c->output = 0;
+}
+static ENCOS_Result send_stop(MT4_motor *obj) {
+    ENCOS_Frame frame;
+    ENCOS_CurrentMode mode = obj->config.stop_mode == mt4_damping_stop ?
+                            ENCOS_DAMPING_BRAKE : ENCOS_CURRENT;
+    ENCOS_Result result = ENCOS_PackCurrent(&frame, obj->config.can_tx_id, mode, 0, 1);
+    return result == ENCOS_OK ? send_frame(obj, &frame) : result;
+}
+static int fresh(MT4_motor *obj, uint8_t field, uint32_t at) {
+    return (obj->feedback_valid & field) &&
+           (uint32_t)(now_ms() - at) < obj->config.feedback_timeout_ms;
+}
+static int motion_ready(MT4_motor *obj) {
+    return !obj->errcode && !obj->zero_pending &&
+           fresh(obj, ENCOS_HAS_POSITION, obj->last_position_ms) &&
+           fresh(obj, ENCOS_HAS_SPEED, obj->last_speed_ms);
+}
+uint8_t MT4motor_Is_Online(MT4_motor *obj) {
+    return obj && obj->seen_reply &&
+           (uint32_t)(now_ms() - obj->last_rx_ms) < obj->config.feedback_timeout_ms;
+}
 uint8_t MT4Motor_Check_InPlace(MT4_motor *obj, float range) {
-    if (obj->monitor->count < 1) return 0;
-    return fabs(obj->ref_position - obj->fdb_position) <= range;
+    return obj && isfinite(range) && range >= 0 && !obj->errcode &&
+           fresh(obj, ENCOS_HAS_POSITION, obj->last_position_ms) &&
+           fabsf(obj->ref_position - obj->real_fdb_position) <= range;
 }
-
-void MT4motor_FeedbackData_Update(MT4_motor *obj, uint8_t *data)
-{
-    obj->last_fdb_position = obj->fdb_position;
-    obj->update = 0;
+ENCOS_Result MT4motor_FeedbackData_Update(MT4_motor *obj, const uint8_t *data, size_t len) {
+    if (!obj) return ENCOS_INVALID;
+    ENCOS_Feedback f;
+    ENCOS_Result result = ENCOS_Decode(data, len, &obj->config.ranges, &f);
+    if (result != ENCOS_OK) return result;
+    obj->feedback = f;
+    memset(obj->rx_data, 0, sizeof(obj->rx_data));
+    memcpy(obj->rx_data, data, len); obj->rx_len = (uint8_t)len;
+    obj->errcode = f.error;
+    obj->last_rx_ms = now_ms(); obj->seen_reply = 1; obj->update = 1;
     obj->monitor->reset(obj->monitor);
-    memcpy(obj->rx_data, data, 8);
-
-    obj->errcode = data[0] & MT4_ERRCODE_MASK;  // 错误码在低5位，与达妙不同
-
-    uint16_t pos_raw = ((uint16_t)data[1] << 8) | data[2];
-    uint16_t spd_raw = ((uint16_t)data[3] << 4) | (data[4] >> 4);
-    uint16_t tor_raw = ((uint16_t)(data[4] & 0x0F) << 8) | data[5];
-
-    obj->fdb_position = MT4_Uint_To_Float(pos_raw, -obj->config.max_position, obj->config.max_position, 16);
-    obj->fdb_speed    = MT4_Uint_To_Float(spd_raw, -obj->config.max_speed,    obj->config.max_speed,    12);
-    obj->fdb_torque   = MT4_Uint_To_Float(tor_raw, -obj->config.max_torque,   obj->config.max_torque,   12);
-    obj->t_mos        = (int8_t)(((int)data[6] - MT4_TEMP_OFFSET) / MT4_TEMP_DIV);
-    // data[7] 本协议未使用
-
-    // 多圈展开：本次与上次相差超过半个量程，即认为跨过了一圈
-    if (obj->fdb_position - obj->last_fdb_position > obj->config.max_position)
-        obj->round--;
-    else if (obj->fdb_position - obj->last_fdb_position < -obj->config.max_position)
-        obj->round++;
-    obj->real_fdb_position = obj->fdb_position
-                           + obj->round * 2 * obj->config.max_position
-                           + obj->config.position_offset;
-
-    // 2π 软回绕：超出 ±wrap_threshold 就折回一圈，并置标志供控制帧反向补偿
-    if (obj->real_fdb_position > obj->config.wrap_threshold) {
-        obj->real_fdb_position -= MT4_2PI;
-        obj->wrap = 1;
-    } else if (obj->real_fdb_position < -obj->config.wrap_threshold) {
-        obj->real_fdb_position += MT4_2PI;
-        obj->wrap = -1;
+    if (f.valid & ENCOS_HAS_POSITION) {
+        obj->last_fdb_position = obj->fdb_position;
+        obj->fdb_position = f.position;
+        obj->real_fdb_position = f.position + obj->config.position_offset;
+        obj->last_position_ms = obj->last_rx_ms;
     }
-
+    if (f.valid & ENCOS_HAS_SPEED) {
+        obj->fdb_speed = f.speed; obj->last_speed_ms = obj->last_rx_ms;
+    }
+    if (f.valid & ENCOS_HAS_CURRENT) {
+        obj->fdb_current = f.current;
+        obj->torque_valid = obj->config.torque_constant > 0;
+        obj->fdb_torque = obj->torque_valid ? f.current * obj->config.torque_constant : NAN;
+    }
+    if (f.valid & ENCOS_HAS_MOTOR_TEMP) obj->t_rotor = f.motor_temp;
+    if (f.valid & ENCOS_HAS_MOS_TEMP) obj->t_mos = f.mos_temp;
+    obj->feedback_valid |= f.valid;
     FrameRateStatistics(&obj->motor_fps);
+    return ENCOS_OK;
 }
-
 void MT4motor_RxCallBack(uint8_t can_id, uint32_t identifier, uint8_t *data, basic_data_t len) {
-    (void)len;
-    (void)can_id;
-
-    for (size_t i = 0; i < mt4_motor_list->cv_len; i++) {
+    if (!mt4_motor_list || !data || len < 2 || len > 8) return;
+    for (size_t i = 0; i < mt4_motor_list->cv_len; ++i) {
         MT4_motor *obj = *(MT4_motor **)cvector_val_at(mt4_motor_list, i);
-        if (obj->config.can_rx_id == identifier) {
-            MT4motor_FeedbackData_Update(obj, data);
+        if (obj->config.bsp_can_index != can_id) continue;
+        if (identifier == obj->config.can_rx_id) {
+            (void)MT4motor_FeedbackData_Update(obj, data, (size_t)len);
+        } else if (identifier == ENCOS_SETTINGS_ID && len == 4 && data[2] == 1 &&
+                   (((uint16_t)data[0] << 8) | data[1]) == obj->config.can_tx_id &&
+                   obj->zero_pending && (data[3] == 3 || data[3] == 0)) {
+            obj->zero_ack_received = 1; obj->zero_ack_success = data[3] == 3;
+            obj->zero_pending = 0;
+            /* Prior coordinates are stale after zeroing; require new telemetry. */
+            obj->feedback_valid &= (uint8_t)~(ENCOS_HAS_POSITION | ENCOS_HAS_SPEED);
+            obj->last_rx_ms = now_ms(); obj->seen_reply = 1;
+            obj->monitor->reset(obj->monitor);
+            obj->update = 1;
         }
     }
 }
-
-/* 组帧并发送一帧控制报文。
- * 使能/失能没有专用帧，都是通过本函数发不同的 kd 实现的。*/
-static void MT4motor_Send_Control(MT4_motor *obj, float kp, float kd,
-                                  float pos, float spd, float tor)
-{
-    // 位置需要抵消掉反馈侧做过的 2π 回绕与位置偏置
-    float pos_eff = pos - obj->config.position_offset
-                  + MT4_2PI * (float)obj->wrap;
-
-    uint16_t kp_send  = MT4_Float_To_Uint(kp,      0,                          obj->config.max_kp,       12);
-    uint16_t kd_send  = MT4_Float_To_Uint(kd,      0,                          obj->config.max_kd,       12);
-    uint16_t pos_send = MT4_Float_To_Uint(pos_eff, -obj->config.max_position,  obj->config.max_position, 16);
-    uint16_t spd_send = MT4_Float_To_Uint(spd,     -obj->config.max_speed,     obj->config.max_speed,    12);
-    uint16_t tor_send = MT4_Float_To_Uint(tor,     -obj->config.max_torque,    obj->config.max_torque,   12);
-
-    /* kd 在总线上只有 9 bit。SDK 直接截断高 3 位，kd 超过约 6.24 会回绕成一个很小的值；
-     * 这里改成饱和，行为在 SDK 实际用到的量程内（kd <= 5）完全一致，且不会突然失去阻尼。*/
-    if (kd_send > ((1 << MT4_KD_WIRE_BITS) - 1))
-        kd_send = (1 << MT4_KD_WIRE_BITS) - 1;
-
-    uint8_t send_data[8];
-    send_data[0] = (kp_send >> 7) & 0xFF;
-    send_data[1] = ((kp_send << 1) & 0xFE) | ((kd_send >> 8) & 0x01);
-    send_data[2] = kd_send & 0xFF;
-    send_data[3] = pos_send >> 8;
-    send_data[4] = pos_send;
-    send_data[5] = spd_send >> 4;
-    send_data[6] = ((spd_send & 0x0F) << 4) | (tor_send >> 8);
-    send_data[7] = tor_send;
-
-    BSP_CAN_Send(obj->config.bsp_can_index, obj->config.can_tx_id, send_data, 8);
+void MT4motor_Driver_Init(void) {
+    if (!mt4_motor_list) mt4_motor_list = cvector_create(sizeof(MT4_motor *));
 }
-
-void MT4motor_Enable(MT4_motor *obj)
-{
-    // 无专用使能帧，发一帧轻阻尼控制帧即可，此时可手动拖动
-    MT4motor_Send_Control(obj, 0.0f, MT4_ENABLE_KD, 0.0f, 0.0f, 0.0f);
-}
-
-void MT4motor_Disable(MT4_motor *obj)
-{
-    // 无专用失能帧，发最大阻尼帧刹车。注意**电机仍然带电**，不是断电
-    MT4motor_Send_Control(obj, 0.0f, MT4_DISABLE_KD, 0.0f, 0.0f, 0.0f);
-}
-
-// TODO: 测试MT4motor_Save_Zero函数
-void MT4motor_Save_Zero(MT4_motor *obj)
-{
-    // 走 0x7FF 广播帧，DLC=4，与控制帧完全是两套格式
-    uint8_t data[4] = {0x00, obj->config.can_tx_id, 0x00, 0x03};
-    BSP_CAN_Send(obj->config.bsp_can_index, MT4_BROADCAST_ID, data, 4);
-}
-
-void MT4motor_Reset_Round(MT4_motor *obj)
-{
-    // 与 SDK 的 resetCircle() 对齐：只清圈数，**不清 wrap 标志**
-    obj->round = 0;
-}
-
-void MT4motor_Driver_Init(void)
-{
-    mt4_motor_list = cvector_create(sizeof(MT4_motor *));
-}
-
-MT4_motor* MT4motor_Create(MT4_motor_config* config, control_mt4_func func)
-{
-    static uint8_t registry[DEVICE_CAN_CNT];
-    if (config->bsp_can_index >= DEVICE_CAN_CNT) {// CAN索引超出范围
-        printf_log("bsp_can_index out of range in %s", __func__);
-        return NULL;
+MT4_motor *MT4motor_Create(MT4_motor_config *config, control_mt4_func func) {
+    if (!config || config->bsp_can_index >= DEVICE_CAN_CNT ||
+        !ENCOS_ValidId(config->can_tx_id) || config->can_rx_id != config->can_tx_id ||
+        !ENCOS_ValidRanges(&config->ranges) || !isfinite(config->position_offset) ||
+        !isfinite(config->torque_constant) || config->torque_constant < 0 ||
+        config->feedback_timeout_ms > 0x7FFFFFFFu ||
+        (config->stop_mode != mt4_soft_stop && config->stop_mode != mt4_damping_stop) ||
+        (config->output_mode != mt4_output_normal && config->output_mode != mt4_output_reverse)) {
+        printf_log("Invalid ENCOS/MT4 config\n"); return NULL;
     }
-    if (config->can_tx_id < MT4_CAN_ID_MIN || config->can_tx_id > MT4_CAN_ID_MAX)
-        printf_log("can_tx_id out of range in %s\n", __func__);
-    // 本协议反馈帧 ID 等于电机自身 ID，两者不一致基本是配置写错了
-    if (config->can_rx_id != config->can_tx_id)
-        printf_log("can_rx_id should equal can_tx_id in %s\n", __func__);
-
-    MT4_motor *obj = (MT4_motor *)RT_MALLOC(sizeof(MT4_motor));
-    if (!registry[config->bsp_can_index]) {
-        registry[config->bsp_can_index] = 1;
-        BSP_CAN_RegisterRxCallback(config->bsp_can_index, MT4motor_RxCallBack);
+    MT4motor_Driver_Init();
+    if (!mt4_motor_list) return NULL;
+    for (size_t i = 0; i < mt4_motor_list->cv_len; ++i) {
+        MT4_motor *old = *(MT4_motor **)cvector_val_at(mt4_motor_list, i);
+        if (old->config.bsp_can_index == config->bsp_can_index &&
+            old->config.can_rx_id == config->can_rx_id) return NULL;
     }
-    memset(obj, 0, sizeof(MT4_motor));
+    MT4_motor *obj = RT_MALLOC(sizeof(*obj));
+    if (!obj) return NULL;
+    memset(obj, 0, sizeof(*obj));
     obj->config = *config;
-
-    // 未填的量程按 SDK 逆向出的默认值补齐
-    if (obj->config.max_position    == 0) obj->config.max_position    = MT4_DEFAULT_MAX_POSITION;
-    if (obj->config.max_speed       == 0) obj->config.max_speed       = MT4_DEFAULT_MAX_SPEED;
-    if (obj->config.max_torque      == 0) obj->config.max_torque      = MT4_DEFAULT_MAX_TORQUE;
-    if (obj->config.max_kp          == 0) obj->config.max_kp          = MT4_DEFAULT_MAX_KP;
-    if (obj->config.max_kd          == 0) obj->config.max_kd          = MT4_DEFAULT_MAX_KD;
-    if (obj->config.wrap_threshold  == 0) obj->config.wrap_threshold  = MT4_DEFAULT_WRAP_THRESHOLD;
-
+    if (!obj->config.fre_rel) obj->config.fre_rel = 1;
+    if (!obj->config.feedback_timeout_ms) obj->config.feedback_timeout_ms = MT4_OFFLINE_TIMEOUT_MS;
+    /* Allocation failures are checked before publishing the motor to callbacks. */
     obj->motor_controller = create_controller(&obj->config.motor_controller_config);
-    obj->control_calc = func;
-    BSP_CAN_AddFilter(obj->config.bsp_can_index, obj->config.can_rx_id);
-    obj->monitor = Monitor_Register(obj->config.lost_callback_, MT4_OFFLINE_TIMEOUT_MS, obj);
-    obj->check_motor_inplace = MT4Motor_Check_InPlace;
-    if (config->fre_rel == 0) {
-        obj->config.fre_rel = 1;  // 默认相对频率为1
+    if (!obj->motor_controller) { RT_FREE(obj); return NULL; }
+    obj->monitor = Monitor_Register(obj->config.lost_callback_,
+                                    (int)obj->config.feedback_timeout_ms, obj);
+    if (!obj->monitor) { RT_FREE(obj->motor_controller); RT_FREE(obj); return NULL; }
+    obj->control_calc = func; obj->check_motor_inplace = MT4Motor_Check_InPlace;
+    obj->fdb_torque = NAN; obj->t_rotor = NAN; obj->t_mos = NAN;
+    cvector_pushback(mt4_motor_list, &obj);
+    if (!registry[config->bsp_can_index]) {
+        BSP_CAN_RegisterRxCallback(config->bsp_can_index, MT4motor_RxCallBack);
+        BSP_CAN_AddFilter(config->bsp_can_index, ENCOS_SETTINGS_ID);
+        registry[config->bsp_can_index] = 1;
     }
-    cvector_pushback(mt4_motor_list, (void *)&obj);
+    BSP_CAN_AddFilter(config->bsp_can_index, config->can_rx_id);
     return obj;
 }
-
-void MT4motor_Calc_Send(void) {
-
-    // 每0.3s补发一次使能帧,防止电机不成功启动
-    static basic_data_t enable_time = 0;
-    if (BSP_sys_time_ms() - enable_time > 300) {
-        for (size_t i = 0; i < mt4_motor_list->cv_len; i++) {
-            MT4_motor *obj = *(MT4_motor **)cvector_val_at(mt4_motor_list, i);
-            MT4motor_Enable(obj);
-            enable_time = BSP_sys_time_ms();
-        }
+ENCOS_Result MT4motor_Enable(MT4_motor *obj) {
+    if (!obj) return ENCOS_INVALID;
+    if (bus_busy(obj->config.bsp_can_index) || !motion_ready(obj)) return ENCOS_BUSY;
+    reset_controller(obj); obj->enable = mt4_enable;
+    return ENCOS_OK; /* next Calc_Send sends the actual control command */
+}
+ENCOS_Result MT4motor_Disable(MT4_motor *obj) {
+    if (!obj) return ENCOS_INVALID;
+    obj->enable = mt4_stop; reset_controller(obj);
+    return obj->last_result = send_stop(obj);
+}
+ENCOS_Result MT4motor_Save_Zero(MT4_motor *obj) {
+    if (!obj) return ENCOS_INVALID;
+    if (bus_busy(obj->config.bsp_can_index)) return ENCOS_BUSY;
+    for (size_t i = 0; i < mt4_motor_list->cv_len; ++i) {
+        MT4_motor *other = *(MT4_motor **)cvector_val_at(mt4_motor_list, i);
+        if (other->config.bsp_can_index == obj->config.bsp_can_index && other->enable != mt4_stop)
+            return ENCOS_BUSY;
     }
-
-    for (size_t i = 0; i < mt4_motor_list->cv_len; i++)
-    {
+    ENCOS_Frame frame;
+    ENCOS_Result r = ENCOS_PackZero(&frame, obj->config.can_tx_id);
+    if (r != ENCOS_OK) return r;
+    obj->zero_pending = 1; obj->zero_ack_received = 0; obj->zero_ack_success = 0;
+    obj->zero_sent_ms = now_ms();
+    obj->feedback_valid &= (uint8_t)~(ENCOS_HAS_POSITION | ENCOS_HAS_SPEED);
+    r = send_frame(obj, &frame);
+    bus_setting_ms[obj->config.bsp_can_index] = now_ms();
+    bus_guard[obj->config.bsp_can_index] = 1;
+    return obj->last_result = r;
+}
+ENCOS_Result MT4motor_Query(MT4_motor *obj, uint8_t code) {
+    if (!obj) return ENCOS_INVALID;
+    ENCOS_Frame frame;
+    ENCOS_Result r = ENCOS_PackQuery(&frame, obj->config.can_tx_id, code);
+    return obj->last_result = r == ENCOS_OK ? send_frame(obj, &frame) : r;
+}
+const char *MT4motor_Err_String(uint8_t code) { return ENCOS_ErrorString(code); }
+ENCOS_Result MT4motor_Clear_Err(MT4_motor *obj) {
+    (void)obj; return ENCOS_UNSUPPORTED; /* No clear-fault command specified in manual. */
+}
+ENCOS_Result MT4motor_Reset_Round(MT4_motor *obj) {
+    (void)obj; return ENCOS_UNSUPPORTED; /* No invented 25rad / 2pi position wrapping. */
+}
+ENCOS_Result MT4motor_Broadcast_Cmd(MT4_motor *obj, uint8_t sub_cmd) {
+    return sub_cmd == 3 ? MT4motor_Save_Zero(obj) : ENCOS_UNSUPPORTED;
+}
+void MT4motor_Calc_Send(void) {
+    if (!mt4_motor_list) return;
+    for (size_t i = 0; i < mt4_motor_list->cv_len; ++i) {
         MT4_motor *obj = *(MT4_motor **)cvector_val_at(mt4_motor_list, i);
-
-        // 频率控制
-        obj->frequency_cnt++;
-        if (obj->frequency_cnt >= obj->config.fre_rel) {
-            obj->frequency_cnt = 0;
-        } else {
-            continue;
+        if (bus_busy(obj->config.bsp_can_index)) continue;
+        /* Missing zero ACK is observable; do not retain an eternal pending state. */
+        if (obj->zero_pending && (uint32_t)(now_ms() - obj->zero_sent_ms) >= MT4_ZERO_ACK_TIMEOUT_MS)
+            obj->zero_pending = 0;
+        if (++obj->frequency_cnt < obj->config.fre_rel) continue;
+        obj->frequency_cnt = 0;
+        if (obj->enable != mt4_enable || !motion_ready(obj)) {
+            obj->enable = mt4_stop; reset_controller(obj);
+            obj->last_result = send_stop(obj); continue;
         }
-
-        //即使stop也应该更新motor_controller
-        if (obj->config.arg != NULL && obj->config.pos_fdb_calc != NULL) {
-            obj->motor_controller->fdb_position = (obj->config.pos_fdb_calc)(obj->config.arg);
-        } else {
-            obj->motor_controller->fdb_position = obj->real_fdb_position * RAD2DEG;
+        controller *c = obj->motor_controller;
+        c->fdb_position = obj->config.pos_fdb_calc ?
+            obj->config.pos_fdb_calc(obj->config.arg) : obj->real_fdb_position * (180 / ENCOS_PI);
+        c->fdb_speed = obj->config.speed_fdb_calc ?
+            obj->config.speed_fdb_calc(obj->config.arg) : obj->fdb_speed * (180 / ENCOS_PI);
+        if (!isfinite(c->fdb_position) || !isfinite(c->fdb_speed)) {
+            (void)MT4motor_Disable(obj); obj->last_result = ENCOS_INVALID; continue;
         }
-        if (obj->config.arg != NULL && obj->config.speed_fdb_calc != NULL) {
-            obj->motor_controller->fdb_speed = (obj->config.speed_fdb_calc)(obj->config.arg);
-        } else {
-            obj->motor_controller->fdb_speed = obj->fdb_speed * RAD2DEG;
+        if (obj->control_calc) obj->control_calc(obj);
+        else {
+            controller_calc(c);
+            obj->ref_torque = obj->config.output_mode == mt4_output_reverse ? -c->output : c->output;
         }
-
-        if (obj->control_calc) {
-            obj->control_calc(obj);
-        } else {
-            controller_calc(obj->motor_controller);
-            if (obj->config.output_mode == mt4_output_reverse) {
-                obj->ref_torque = (-1.0f) * obj->motor_controller->output;
-            } else {
-                obj->ref_torque = obj->motor_controller->output;
-            }
-        }
-
-        if (obj->enable == mt4_enable)
-        {
-            if (fabsf(obj->ref_position) > obj->config.max_position)
-                obj->ref_position = obj->config.max_position * (obj->ref_position > 0 ? 1 : -1);
-            if (fabsf(obj->ref_speed) > obj->config.max_speed)
-                obj->ref_speed = obj->config.max_speed * (obj->ref_speed > 0 ? 1 : -1);
-            if (fabsf(obj->ref_torque) > obj->config.max_torque)
-                obj->ref_torque = obj->config.max_torque * (obj->ref_torque > 0 ? 1 : -1);
-            if (obj->kp > obj->config.max_kp)
-                obj->kp = obj->config.max_kp;
-            if (obj->kd > obj->config.max_kd)
-                obj->kd = obj->config.max_kd;
-
-            MT4motor_Send_Control(obj, obj->kp, obj->kd,
-                                  obj->ref_position, obj->ref_speed, obj->ref_torque);
-        }
-        // 电机stop模式
-        else
-        {
-            MT4motor_Disable(obj);
-        }
+        if (bus_busy(obj->config.bsp_can_index)) continue;
+        if (obj->enable != mt4_enable) { obj->last_result = send_stop(obj); continue; }
+        ENCOS_Frame frame;
+        ENCOS_Result r = ENCOS_PackMixed(&frame, obj->config.can_tx_id, &obj->config.ranges,
+            obj->kp, obj->kd, obj->ref_position - obj->config.position_offset,
+            obj->ref_speed, obj->ref_torque);
+        if (r != ENCOS_OK) {
+            (void)MT4motor_Disable(obj); obj->last_result = r;
+        } else obj->last_result = send_frame(obj, &frame);
     }
 }
-
 #else
-void MT4motor_Driver_Init(void){}
-void MT4motor_Calc_Send(void){}
-
+void MT4motor_Driver_Init(void) {}
+void MT4motor_Calc_Send(void) {}
 #endif

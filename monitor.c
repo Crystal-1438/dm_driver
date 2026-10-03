@@ -15,7 +15,9 @@ monitor_item* Monitor_Register(lost_callback callback, int count, void* callback
     if (monitor_lists == NULL) {
         Monitor_Init();
     }
+    if (monitor_lists == NULL) return NULL;
     monitor_item* item = RT_MALLOC(sizeof(monitor_item));
+    if (item == NULL) return NULL;
     item->reload_count = count;
     item->count = 0;
     item->callback = callback;
@@ -26,7 +28,7 @@ monitor_item* Monitor_Register(lost_callback callback, int count, void* callback
 }
 
 void Monitor_Loop() {
-    for (int i = 0; i < monitor_lists->cv_len; i++) {
+    for (size_t i = 0; i < monitor_lists->cv_len; i++) {
         // void* val = cvector_val_at(monitor_lists, i);
         monitor_item* item = *(monitor_item**)cvector_val_at(monitor_lists, i);
         item->count--;
