@@ -23,43 +23,6 @@
 
 const double EPS = 1e-6;
 
-// ----------- 模糊PID相关参数与函数定义 -----------
-// 模糊规则表
-static const float FUZZY_KP_TABLE_NORMAL[FUZZY_E_LEVEL][FUZZY_DE_LEVEL] = {
-    {0.3, 0.3, 0.4, 0.5, 0.6, 0.7, 0.7},
-    {0.3, 0.4, 0.5, 0.6, 0.7, 0.7, 0.7},
-    {0.4, 0.5, 0.6, 0.7, 0.7, 0.7, 0.7},
-    {0.5, 0.6, 0.7, 0.8, 0.7, 0.6, 0.5},
-    {0.7, 0.7, 0.7, 0.7, 0.6, 0.5, 0.4},
-    {0.7, 0.7, 0.7, 0.6, 0.5, 0.4, 0.3},
-    {0.7, 0.7, 0.6, 0.5, 0.4, 0.3, 0.3}
-};
-static const float FUZZY_KI_TABLE_NORMAL[FUZZY_E_LEVEL][FUZZY_DE_LEVEL] = {
-    {0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0},
-    {0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0},
-    {0.0, 0.0, 0.5, 0.5, 0.5, 0.0, 0.0},
-    {0.0, 0.0, 0.5, 1.0, 0.5, 0.0, 0.0},
-    {0.0, 0.0, 0.5, 0.5, 0.5, 0.0, 0.0},
-    {0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0},
-    {0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0}
-};
-static const float FUZZY_KD_TABLE_NORMAL[FUZZY_E_LEVEL][FUZZY_DE_LEVEL] = {
-    {0.8, 0.8, 0.9, 1.0, 0.9, 0.8, 0.8},
-    {0.8, 0.7, 0.8, 0.9, 0.8, 0.7, 0.8},
-    {0.9, 0.8, 0.6, 0.5, 0.6, 0.8, 0.9},
-    {1.0, 0.9, 0.5, 0.1, 0.5, 0.9, 1.0},
-    {0.9, 0.8, 0.6, 0.5, 0.6, 0.8, 0.9},
-    {0.8, 0.7, 0.8, 0.9, 0.8, 0.7, 0.8},
-    {0.8, 0.8, 0.9, 1.0, 0.9, 0.8, 0.8}
-};
-
-// 模糊量化函数，将输入值归一化到[-3,3]区间
-static int fuzzy_quantize(float x) {
-	if (x <= -3.0f) return 0;
-	if (x >= 3.0f) return 6;
-	return (int)(x + 3.5f);
-}
-
 void PID_Init(PID* pid, PID_Config* config) { pid->config = *config; }
 
 /**
@@ -70,16 +33,11 @@ void PID_Calc(PID* pid) {
     pid->error[2] = pid->error[1];        // 上上次误差
     pid->error[1] = pid->error[0];        // 上次误差
     pid->error[0] = pid->ref - pid->fdb;  // 本次误差
-#pragma GCC diagnostic push
-#pragma GCC diagnostic ignored "-Wfloat-equal"
-    if (pid->config.D_ahead != D_AHEAD_USED) {
-        if (fabsf(pid->error[0] - pid->error[1]) > (float)EPS) {
-            pid->d_error = pid->error[0] - pid->error[1];
-        } else if (fabsf(pid->error[0] - pid->error[1]) <= (float)EPS && fabsf(pid->error[1] - pid->error[0]) <= (float)EPS && fabsf(pid->d_error) < (1000.0f * (float)EPS)) {
-            pid->d_error = pid->error[0] - pid->error[1];
-        }
+    if (fabsf(pid->error[0] - pid->error[1]) > (float)EPS) {
+        pid->d_error = pid->error[0] - pid->error[1];
+    } else if (fabsf(pid->d_error) < (1000.0f * (float)EPS)) {
+        pid->d_error = pid->error[0] - pid->error[1];
     }
-#pragma GCC diagnostic pop
 
     // 位置式PID
     if (pid->config.PID_mode == PID_POSITION) {
@@ -111,30 +69,6 @@ void PID_Calc(PID* pid) {
             pid->error_sum = fsgn(pid->error[0]) * pid->config.error_preload;
         }
     }
-    // 模糊PID
-    else if (pid->config.PID_mode == PID_FUZZY) {
-		// 归一化误差和误差变化率
-		float e_norm = pid->error[0] / pid->config.error_domain * 3.0f;
-		float de_norm = pid->d_error / pid->config.d_error_domain * 3.0f;
-		int e_idx = fuzzy_quantize(e_norm);
-		int de_idx = fuzzy_quantize(de_norm);
-		// 查表获得增益
-		float kp = pid->config.KP * (*pid->config.fuzzy_table[0])[e_idx][de_idx];
-		float ki = pid->config.KI * (*pid->config.fuzzy_table[1])[e_idx][de_idx];
-		float kd = pid->config.KD * (*pid->config.fuzzy_table[2])[e_idx][de_idx];
-		// 基于位置式PID
-		if (fabsf(pid->error[0]) < pid->config.Irange) {
-			pid->error_sum += pid->error[0];
-			pid->error_sum = _MID(pid->error_sum, -pid->config.error_max,
-								  pid->config.error_max);
-			pid->output = kp * pid->error[0] + ki * pid->error_sum +
-						  kd * (pid->error[0] - pid->error[1]);
-		} else {
-			pid->error_sum = 0;
-			pid->output =
-				kp * pid->error[0] + kd * (pid->error[0] - pid->error[1]);
-		}
-	}
 
     /*------- 输出上限 -------*/
     pid->output_unlimited = pid->output;
@@ -150,7 +84,6 @@ void PID_SetConfig_Pos(PID_Config* obj, float kp, float ki, float kd, float erro
     obj->error_max = errormax;
     obj->outputMax = outputmax;
     obj->Irange = 0;
-    obj->D_ahead = D_AHEAD_UNUSED;  // 默认关闭微分先行
 }
 
 /**
@@ -178,26 +111,4 @@ void PID_SetConfig_Comp(PID_Config* obj, float kp_rough, float kp_fine, float ki
     obj->error_preload = errorpreload;  // 位置环积分预载
     obj->error_max = errormax;
     obj->outputMax = outputmax;
-    obj->D_ahead = D_AHEAD_UNUSED;  // 默认关闭微分先行
-}
-
-// 配置模糊PID的参数
-void PID_SetConfig_Fuzzy(PID_Config* obj, float kp, float ki, float kd,float error_domain,float d_error_domain, float errormax, float outputmax) {
-	obj->PID_mode = PID_FUZZY;
-	obj->KP = kp;
-	obj->KI = ki;
-	obj->KD = kd;
-	obj->error_max = errormax;
-	obj->outputMax = outputmax;
-	obj->Irange = 0;
-	obj->D_ahead = D_AHEAD_UNUSED;	// 默认关闭微分先行
-	obj->error_domain = fabsf(error_domain);
-	obj->d_error_domain = fabsf(d_error_domain);
-	//默认使用普通模糊规则表
-	obj->fuzzy_table[0] =
-		(float(*)[FUZZY_E_LEVEL][FUZZY_DE_LEVEL])FUZZY_KP_TABLE_NORMAL;
-	obj->fuzzy_table[1] =
-		(float(*)[FUZZY_E_LEVEL][FUZZY_DE_LEVEL])FUZZY_KI_TABLE_NORMAL;
-	obj->fuzzy_table[2] =
-		(float(*)[FUZZY_E_LEVEL][FUZZY_DE_LEVEL])FUZZY_KD_TABLE_NORMAL;
 }
